@@ -1,0 +1,225 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Blue/Green Deployment Setup
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: BGVPC
+
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [ 0, !GetAZs ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnetA
+
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [ 1, !GetAZs ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnetB
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP and HTTPS traffic
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH and application traffic
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+  BlueLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: ami-xxxxxxxx # Replace with your AMI ID
+      InstanceType: t2.micro
+      SecurityGroups:
+        - !Ref InstanceSecurityGroup
+      KeyName: my-key-pair # Replace with your key pair
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          export DB_ENDPOINT=blue-db-endpoint.amazonaws.com
+          # Start application
+          nohup ./my-web-app &
+
+  BlueAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref SubnetA
+        - !Ref SubnetB
+      LaunchConfigurationName: !Ref BlueLaunchConfig
+      MinSize: 1
+      MaxSize: 3
+      DesiredCapacity: 1
+      TargetGroupARNs:
+        - !Ref BlueTargetGroup
+
+  GreenLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: ami-yyyyyyyy # Replace with your AMI ID
+      InstanceType: t2.micro
+      SecurityGroups:
+        - !Ref InstanceSecurityGroup
+      KeyName: my-key-pair # Replace with your key pair
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          export DB_ENDPOINT=green-db-endpoint.amazonaws.com
+          # Start application
+          nohup ./my-web-app &
+
+  GreenAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref SubnetA
+        - !Ref SubnetB
+      LaunchConfigurationName: !Ref GreenLaunchConfig
+      MinSize: 1
+      MaxSize: 3
+      DesiredCapacity: 1
+      TargetGroupARNs:
+        - !Ref GreenTargetGroup
+  BlueLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: BlueALB
+      Subnets:
+        - !Ref SubnetA
+        - !Ref SubnetB
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Scheme: internet-facing
+
+  BlueTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VPC
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: 80
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: 200
+      Name: BlueTargetGroup
+
+  BlueListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref BlueTargetGroup
+      LoadBalancerArn: !Ref BlueLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: arn:aws:acm:region:account-id:certificate/certificate-id # Replace with your certificate ARN
+
+  GreenLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: GreenALB
+      Subnets:
+        - !Ref SubnetA
+        - !Ref SubnetB
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Scheme: internet-facing
+
+  GreenTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VPC
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: 80
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: 200
+      Name: GreenTargetGroup
+
+  GreenListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref GreenTargetGroup
+      LoadBalancerArn: !Ref GreenLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: arn:aws:acm:region:account-id:certificate/certificate-id # Replace with your certificate ARN
+  Route53BlueRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: example.com. # Replace with your domain
+      Name: www.example.com. # Replace with your domain
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt BlueLoadBalancer.DNSName
+        HostedZoneId: !GetAtt BlueLoadBalancer.CanonicalHostedZoneID
+
+  Route53GreenRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: example.com. # Replace with your domain
+      Name: www.example.com. # Replace with your domain
+      Type: A
+      SetIdentifier: "Green"
+      Weight: 0 # Initial weight for Green environment
+      AliasTarget:
+        DNSName: !GetAtt GreenLoadBalancer.DNSName
+        HostedZoneId: !GetAtt GreenLoadBalancer.CanonicalHostedZoneID
+
+  Route53GreenRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: example.com. # Replace with your domain
+      Name: www.example.com. # Replace with your domain
+      Type: A
+      SetIdentifier: "Green"
+      Weight: 0 # Initial weight for Green environment
+      AliasTarget:
+        DNSName: !GetAtt GreenLoadBalancer.DNSName
+        HostedZoneId: !GetAtt GreenLoadBalancer.CanonicalHostedZoneID
